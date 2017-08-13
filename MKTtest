@@ -1,0 +1,144 @@
+## this is a pipeline to do the McDonald Kreitman test assuming you have
+# (1) a genome or transcriptome assembly
+# (2) a VCF file with the SNPs you want to use in the analysis
+# (3) a gff or gtf file with the annotations of your genome (coding sequences/ORFs), eg from transdecoder or hmmer2go
+## we will be using snpEFF - http://snpeff.sourceforge.net/ - vcftools - http://vcftools.sourceforge.net/ - and R
+
+
+
+############# snpEFF ###################
+
+## build data base
+
+#edit config file and add line for your organism in the database section. eg :
+
+"# your_species
+your_species.genome: your_species (your_family)"
+
+# make folder for genome
+mkdir /snpEff/data/your_species
+
+#copy and rename files - fasta, gff with coding regions/ORFs (eg from transdecoder), vcf:
+cd /snpEff/data/your_species
+cp your_species_refgenome.fa ./
+mv your_species_refgenome.fa sequences.fa
+cp your_species_annotation.gff3 ./
+mv your_species_annotation.gff3 genes.gff
+cp your_SNPs.vcf ./
+
+# build
+java -jar /mnt/e/Software/snpEff/snpEff.jar build -gff3 -v your_species
+
+## annotate VCF file
+
+java -Xmx4g -jar /mnt/e/Software/snpEff/snpEff.jar your_species your_SNPs.vcf > your_SNPs.annotated.vcf
+
+############## VCFtools ##################
+
+## select loci for analysis
+## filter for minor allele frequency using vcftools - relatively high threshold: 10%/15%/20%
+
+vcftools --vcf your_SNPs.annotated.vcf --maf 0.10 --recode-INFO-all --recode --out your_SNPs.annotated.MAF10
+
+
+## ouput frequency statistics using vcftools
+
+vcftools --vcf your_SNPs.annotated.MAF10.recode.vcf --keep species1_names.txt --freq --out species1_freq
+vcftools --vcf your_SNPs.annotated.MAF10.recode.vcf --keep species2_names.txt --freq --out species2_freq
+
+
+## in R
+
+# read in vcf file and rename column 1 to "contig"
+vcf_path="path/to/vcf/your_SNPs.annotated.MAF10.recode.vcf"
+vcf_file<-readLines(vcf_path)
+vcf_SNPs<-data.frame(vcf_file[grep(pattern="#CHROM",vcf_file):length(vcf_file)])
+vcf_SNPs <- data.frame(do.call('rbind', strsplit(as.character(vcf_SNPs[,1]),'\t',fixed=TRUE)))
+colnames(vcf_SNPs) <- as.character(unlist(vcf_SNPs[1,]))
+vcf_SNPs<-vcf_SNPs[-1,]
+colnames(vcf_SNPs)[1]="contig"
+
+# read in allele frequencies (the output from vcftools is a bit unpractical, so we split the columns)
+species1_freq_path="species1_freq.frq"
+species1_freq<-read.delim(species1_freq_path, header=FALSE, skip=1)
+colnames(species1_freq)<-c("contig","pos","n_alleles","n_chromosomes","ref","alt")
+library(tidyr)
+species1_freq<-separate(species1_freq,ref,c("ref_allele","ref_freq"), ":")
+species1_freq<-separate(species1_freq,alt,c("alt_allele","alt_freq"), ":")
+species1_freq$ref_freq<-as.numeric(species1_freq$ref_freq)
+species1_freq$alt_freq<-as.numeric(species1_freq$alt_freq)
+
+species2_freq_path="species2_freq.frq"
+species2_freq<-read.delim(species2_freq_path, header=FALSE, skip=1)
+colnames(species2_freq)<-c("contig","pos","n_alleles","n_chromosomes","ref","alt")
+library(tidyr)
+species2_freq<-separate(species2_freq,ref,c("ref_allele","ref_freq"), ":") # separate columns into new columns based on delimiter ":"
+species2_freq<-separate(species2_freq,alt,c("alt_allele","alt_freq"), ":")
+species2_freq$ref_freq<-as.numeric(species2_freq$ref_freq)
+species2_freq$alt_freq<-as.numeric(species2_freq$alt_freq)
+
+# attach allele frequencies to SNP file
+vcf_SNPs$species1_ref_freq<-species1_freq$ref_freq
+vcf_SNPs$species1_alt_freq<-species1_freq$alt_freq
+
+vcf_SNPs$species2_ref_freq<-species2_freq$ref_freq
+vcf_SNPs$species2_alt_freq<-species2_freq$alt_freq
+
+# only keep SNPs that are either synonymous or nonsynonymous.
+vcf_SNPs<-vcf_SNPs[grep(pattern="synonymous_variant|missense_variant",vcf_SNPs$INFO),]
+vcf_SNPs$annotation<-separate(vcf_SNPs,INFO,c("A","B","C","D","E","F","G","H","J","K","L","Z","X","N","V","Q","W","R"), "\\|")[,"B"] # random number of columns with random column names, needs to be more than the maximum amount of columns possible, you only need the second column
+vcf_SNPs$contig<-factor(vcf_SNPs$contig) # reset factor levels
+
+## count pN, pS, dN, dS
+
+# create columns with 0s
+vcf_SNPs$pN<-0
+vcf_SNPs$pS<-0
+vcf_SNPs$dN<-0
+vcf_SNPs$dS<-0
+vcf_SNPs$pN_species1<-0
+vcf_SNPs$pS_species1<-0
+vcf_SNPs$pN_species2<-0
+vcf_SNPs$pS_species2<-0
+
+# check the category a SNP falls into
+for(i in 1:nrow(vcf_SNPs)) {
+	if((vcf_SNPs$species1_ref_freq[i]==0 || vcf_SNPs$species1_alt_freq[i]==0) && (vcf_SNPs$species2_ref_freq[i]==0 || vcf_SNPs$species2_alt_freq[i]==0) && "synonymous_variant" %in% vcf_SNPs$annotation[i]) { vcf_SNPs$dS[i]<-1 }
+	if((vcf_SNPs$species1_ref_freq[i]==0 || vcf_SNPs$species1_alt_freq[i]==0) && (vcf_SNPs$species2_ref_freq[i]==0 || vcf_SNPs$species2_alt_freq[i]==0) && "missense_variant" %in% vcf_SNPs$annotation[i]) { vcf_SNPs$dN[i]<-1 }
+	if((vcf_SNPs$species1_ref_freq[i]!=0 && vcf_SNPs$species1_alt_freq[i]!=0) && (vcf_SNPs$species2_ref_freq[i]!=0 && vcf_SNPs$species2_alt_freq[i]!=0) && "synonymous_variant" %in% vcf_SNPs$annotation[i]) { vcf_SNPs$pS[i]<-1 }
+	if((vcf_SNPs$species1_ref_freq[i]!=0 && vcf_SNPs$species1_alt_freq[i]!=0) && (vcf_SNPs$species2_ref_freq[i]!=0 && vcf_SNPs$species2_alt_freq[i]!=0) && "missense_variant" %in% vcf_SNPs$annotation[i]) { vcf_SNPs$pN[i]<-1 }
+	if((vcf_SNPs$species1_ref_freq[i]==0 || vcf_SNPs$species1_alt_freq[i]==0) && (vcf_SNPs$species2_ref_freq[i]!=0 && vcf_SNPs$species2_alt_freq[i]!=0) && "synonymous_variant" %in% vcf_SNPs$annotation[i]) { vcf_SNPs$pS_species1[i]<-1 }
+	if((vcf_SNPs$species1_ref_freq[i]==0 || vcf_SNPs$species1_alt_freq[i]==0) && (vcf_SNPs$species2_ref_freq[i]!=0 && vcf_SNPs$species2_alt_freq[i]!=0) && "missense_variant" %in% vcf_SNPs$annotation[i]) { vcf_SNPs$pN_species1[i]<-1 }
+	if((vcf_SNPs$species1_ref_freq[i]!=0 && vcf_SNPs$species1_alt_freq[i]!=0) && (vcf_SNPs$species2_ref_freq[i]==0 || vcf_SNPs$species2_alt_freq[i]==0) && "synonymous_variant" %in% vcf_SNPs$annotation[i]) { vcf_SNPs$pS_species2[i]<-1 }
+	if((vcf_SNPs$species1_ref_freq[i]!=0 && vcf_SNPs$species1_alt_freq[i]!=0) && (vcf_SNPs$species2_ref_freq[i]==0 || vcf_SNPs$species2_alt_freq[i]==0) && "missense_variant" %in% vcf_SNPs$annotation[i]) { vcf_SNPs$pN_species2[i]<-1 }
+	}
+
+
+# make empty data.frame
+MKT<-data.frame(contig=factor(),pN=numeric(), pS=numeric(), dN=numeric(), dS=numeric())
+
+#sum pNs, pSs, dNs, and dSs for each contig across SNPs
+for( i in 1:length(levels(vcf_SNPs$contig))) {
+	temp<-vcf_SNPs[which(vcf_SNPs$contig==levels(vcf_SNPs$contig)[i]),]
+	MKT<-rbind(MKT,data.frame(
+	contig=as.character(temp$contig[1]),
+	pN=sum(temp[,c("pN","pN_species1","pN_species2")]),
+	pS=sum(temp[,c("pN","pS_species1","pS_species2")]),
+	dN=sum(temp[,"dN"]),
+	dS=sum(temp[,"dS"])))
+}
+
+# perform MKT test
+MKT$pN.pS=MKT$pN/MKT$pS # calculate ration of nonsynonymous to synonymous polymorphisms
+MKT$dN.dS=MKT$dN/MKT$dS # calculate ration of nonsynonymous to synonymous substitutions
+MKT$fisher.test.P<-99  # create new column for p-values
+for(i in 1:nrow(MKT)){
+	MKT$fisher.test.P[i]<-fisher.test(matrix(as.numeric(MKT[i,c(3,2,5,4)]), ncol=2))$p.value # calculate fisher exact test and copy p-value for every contig
+	if((MKT$pN[i] == 0 && MKT$dN[i] == 0) || (MKT$pS[i] == 0 && MKT$dS[i] == 0) || (MKT$pS[i] == 0 && MKT$pN[i] == 0) || (MKT$dS[i] == 0 && MKT$dN[i] == 0)) { MKT$fisher.test.P[i]<-NA} # this lines assigns an NA to all p-values that are meaningless, because the contingency table was incomplete
+	if(sum(as.numeric(MKT[i,c(3,2,5,4)])) < 3) { MKT$fisher.test.P[i]<-NA } # only use cases where total number of SNPs is higher than or equal to 3
+	}
+
+MKT_noNAs<-MKT[which(MKT$fisher.test.P != "NA"),] # remove all cases where fisher exact test is meaningless
+
+# multiple hypothesis testing. It seems to be uncommon with MKT; probably because fisher exact produces low P-values only with much higher counts than are common for SNP data
+MKT_noNAs$fisher.test.P<-p.adjust(MKT_noNAs$fisher.test.P, method = "BH") # correct p-values using Benjamini & Hochberg (1985) FDR
