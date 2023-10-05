@@ -1,0 +1,198 @@
+### this is a pipeline for obtaining haplotype sequences from RNA-seq data using vcftools, fastPhase, vcflib, and custom Python and R scripts. This pipeline was developped for Thomas Blankers, Sibelle T. Vilaça, Isabelle Waurick, David A. Gray, R. Matthias Hennig, Camila J. Mazzoni, Frieder Mayer, Emma L. Berdan, Demography and selection shape transcriptomic divergence in field crickets, Evolution, Volume 72, Issue 3, 1 March 2018, Pages 553–567, https://doi.org/10.1111/evo.13435. Please cite accordingly
+1.	Create separate VCF files for each contig. Run vcftools with –-chr xxx where xxx is the desired transcript id. Example: 
+
+vcftools --vcf /home/rubtex.vcf --out /home/rubtex_subset1.1 --chr c197865_g1_i1 --recode
+
+2.	Change from vcf to fastphase format by running vcf2fastphase.pl (from Laurie Stevison with permission: https://github.com/lstevison/vcf-conversion-tools/blob/master/vcf2fastPHASE.pl).
+	
+Run as:
+./vcf2fastPHASE.pl –input.vcf –outputfile1 –outputfile2 –samplesize
+
+The input file is the contig specific vcf file, the output files have to be specified. Example (40 individuals): 
+
+./vcf2fastphase.pl /home/rubtex_subset1.1.recode.vcf rubtex_subset1.1 rubtex_subset1.1a 40 
+
+3.	Run fastphase for every file.
+
+Run as:
+	./fastPHASE_Linux -T20 –usubpops –outputfile –inputfile 
+	
+The input file is the first of the two output files in step 2. The output file gets the extension hapguess_switch.out. Example: 
+
+./fastPHASE_Linux -T20 -usubpops -oresults_subset1.1 -rubtex_subset1.1
+
+4.	Change fastphase files back to vcf by running fastphase2vcf.pl (from Laurie Stevison with permission: https://github.com/lstevison/vcf-conversion-tools/blob/master/fastPHASE2VCF.pl )
+	
+Run as:
+./fastphase2vcf.pl -inputfile1 –inputfile2 –outputfile.vcf –blocks
+	
+“inputfile1” is the first output file in step 2, “inputfile2” is the hapguess_switch.out file from step 3. “–outputfile.vcf” specifies a new vcf file, “blocks” is the number of contigs (in this case 1). Example:
+	
+./fastphase2vcf.pl rubtex_subset1.1 results_subset1.1_hapguess_switch.out /home/rubtex_subset1.1.phased.vcf 1
+
+5.	Merge all vcf files together using the vcf-concat tool from vcftools. Example: 
+
+./vcf-concat /home/rubtex_subset1.1.phased.vcf /home/rubtex_subset1.2.phased.vcf /home/rubtex_subset1.3.phased.vcf > /home/rubtex_finalhaps_merged.vcf
+
+6.	Split merged vcf file by individual using vcftools. Example:
+	
+./vcftools --vcf /home/rubtex_finalhaps_merged.vcf --recode --out /home/rub30038 --indv rub30038 --recode-INFO-all
+
+7.	Change vcf files to haplotypes with vcflib’s vcfgeno2haplo program. Example:
+	
+./vcfgeno2haplo -r /home/reference_transcriptome.fasta -w 2000 /home/rub30038.recode.vcf > rub30038_haps.txt
+
+8.	Reformat haplotypes using custom script by Marie Jeschek. Script is attached below. Example:
+	
+python vcf2hap.py reference_haplotypes2.fasta rub30038_haps.txt rub30038.haps.
+	
+Here the fasta file contains only the transcripts that you are making haplotypes for.
+	
+	Python script (depends: BioPython):
+	
+from Bio import SeqIO
+
+
+
+# parse arguments
+parser = argparse.ArgumentParser(description="Read haplotype sequences from VCF file.", formatter_class=argparse.RawTextHelpFormatter)
+parser.add_argument("-r", required=True, metavar="referenceFile", type=argparse.FileType('r'),help="Fasta file with reference.")
+parser.add_argument("-v", required=True, metavar="vcffile", type=argparse.FileType('r'),help="VCF file.")
+parser.add_argument("-o", required=True, metavar="outputFile", type=argparse.FileType('w'),help="New table with complete haplotype sequences.")
+args = parser.parse_args()
+
+# parse vcf and collect data
+print("Parsing vcf ...")
+snpData = {}
+for line in args.v:
+	if line.startswith("#"):
+		continue
+	
+(CHROM,POS,ID,REF,ALT,QUAL,FILTER,INFO,FORMAT,RUB) = line.strip("\n").split("\t")
+	if CHROM in snpData:
+		print("Warning: Contig is there twice: %s" % CHROM)
+		alleles=[REF] + ALT.split(",")
+	
+snpData[CHROM] = (alleles[int(RUB[0])] , alleles[int(RUB[2])])
+
+
+# get reference sequence and write haplotypes
+print("Reading reference ...")
+reference={}
+args.o.write("Contig\tHaplotype_1\tHaplotype_2\n")
+for sR in SeqIO.parse(args.r,"fasta"):
+	print("\t%s"%sR.id)
+	if sR.id not in snpData:
+args.o.write("%s\t%s\t%s\n" % (sR.id,str(sR.seq),str(sR.seq)))
+	else:
+args.o.write("%s\t%s\t%s\n" % (sR.id,snpData[sR.id][0],snpData[sR.id][1]))
+
+print("Done.")
+
+
+9.	Place the phased sequences back into the original contigs using custom R script. 
+
+R script:
+
+library(seqinr)
+
+ref<-read.fasta("fastafilename.fasta", seqtype="DNA", as.string=TRUE, forceDNAtolower = FALSE)
+#this is the fasta file with the complete list of contigs
+
+haplotypes_ref<-read.fasta("haplotype_ref.fasta", seqtype="DNA", as.string=TRUE, forceDNAtolower = FALSE)
+#this is the fasta file with only the contigs for which #haplotypes have been reconstructed
+
+hapfiles=dir(pattern="*txt.haps")
+#hapfiles summarizes the file names of all haplotype output #files (with the extension txt.haps)
+
+old_haplotypes<-list()
+new_haplotypes<-list()
+haplotypes<-NULL
+
+#first, concatenate the output haplotypes of all individuals 
+for(i in 1:length(hapfiles)) {
+
+old_haplotypes[[i]]<-as.data.frame(read.delim(hapfiles[i], sep="\t", header=TRUE))
+	}
+	
+names(old_haplotypes)<-hapfiles
+	
+	
+#Then, place these haplotypes back into the original contigs so #that each individual has two phased copies of the full sequence #of each contig 	
+for(j in 1:length(old_haplotypes)) {
+	
+haplotypes<-old_haplotypes[[j]]
+	for(i in seq(1:length(haplotypes_ref))) {
+		
+contig<-match(names(haplotypes_ref[i]),names(ref))
+overlap<-regexpr(as.character(haplotypes_ref[i]), as.character(ref[contig]), fixed=TRUE)
+		begin<-overlap[1]
+		fin<-begin+attributes(overlap)$match.length
+haplotypes[i,4]<-paste(substring(ref[contig], first=1, last=begin-1),haplotypes[i,2],substring(ref[contig], first=fin, last=nchar(ref[contig])),sep="")
+haplotypes[i,5]<-paste(substring(ref[contig], first=1, last=begin-1),haplotypes[i,3],substring(ref[contig], first=fin, last=nchar(ref[contig])),sep="")
+colnames(haplotypes)[4:5]<-c("full_haplo_1","full_haplo_2")		
+		}
+	
+new_haplotypes[[j]]<-haplotypes
+	}
+
+names(new_haplotypes)<-hapfiles
+
+#From the list new_haplotypes the new haplotypes can be #extracted in any desired way. For example, simply write a text #file for each individual
+#with the haplotype sequences for each contig:
+
+for(i in 1:length(new_haplotypes)) {
+write.table(new_haplotypes[[i]], paste("new_haplotypes_",names(new_haplotypes)[i],".txt",sep=""), sep="\t", quote=FALSE, row.names=FALSE)
+	}
+	
+#Or create a fasta file for each contig that contains the two #haplotype sequence for each individual, as would be the case #for BEAST. 
+
+#In our case we had two species (rub and tex) and we separated #out the sequences of the two species first, then wrote them to #a fasta file.
+
+#Each entry was labelled with the individual name (two entries #per individual)
+new_haplotypes_rub<-list()
+new_haplotypes_tex<-list()
+n_rub<-20
+n_tex<-20
+
+for(i in 1:n_rub) {
+	new_haplotypes_rub[[i]]<-new_haplotypes[[i]]
+	}
+	
+for(i in 1:n_tex) {
+	new_haplotypes_tex[[i]]<-new_haplotypes[[i+n_rub]]
+	}
+for(i in 1:length(new_haplotypes_rub)) {
+	
+ind_haplotypes<-new_haplotypes_rub[[i]]
+	for(j in 1:nrow(ind_haplotypes)) {
+		
+temp_fasta<-list()
+		temp_fasta[[1]]<-as.character(ind_haplotypes[j,4])
+names(temp_fasta)[1]<-strsplit(names(new_haplotypes)[i],"_")[[1]][3]
+		temp_fasta[[2]]<-as.character(ind_haplotypes[j,5])
+names(temp_fasta)[2]<-strsplit(names(new_haplotypes)[i],"_")[[1]][3]
+
+filename=paste("rub_",as.character(ind_haplotypes[j,1]),".fasta",sep="")
+		
+write.fasta(sequences=temp_fasta, names=names(temp_fasta), file.out=filename, nbchar=60, open="a")
+		}
+	}
+	
+
+for(i in 1:length(new_haplotypes_tex)) {
+	
+ind_haplotypes<-new_haplotypes_tex[[i]]
+	for(j in 1:nrow(ind_haplotypes)) {
+		
+temp_fasta<-list()
+		temp_fasta[[1]]<-as.character(ind_haplotypes[j,4])
+names(temp_fasta)[1]<-strsplit(names(new_haplotypes)[i+20],"_")[[1]][3]
+		temp_fasta[[2]]<-as.character(ind_haplotypes[j,5])
+names(temp_fasta)[2]<-strsplit(names(new_haplotypes)[i+20],"_")[[1]][3]
+
+filename=paste("tex_",as.character(ind_haplotypes[j,1]),".fasta",sep="")
+
+write.fasta(sequences=temp_fasta, names=names(temp_fasta), file.out=filename, nbchar=60, open="a")		
+		}
+	} 
